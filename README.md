@@ -3,7 +3,7 @@ Scalable distributed FFT implementation for heterogeneous CPU/GPU systems, built
 
 ![Task-scheduled 3D FFT pipeline](docs/assets/pencil.png)
 
-> **Figure:** Task-scheduled 3D FFT pipeline (click to view full PDF).
+> **Figure:** Task-scheduled 3D FFT implementation using pencil decomposition, asynchronous transforms, and data movement.
 
 ## Installation
 
