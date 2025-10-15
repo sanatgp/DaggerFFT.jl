@@ -1,7 +1,7 @@
 # DaggerFFT.jl
 Scalable distributed FFT implementation for heterogeneous CPU/GPU systems, built on Dagger.jl
 
-[<img src="docs/assets/pencil_thumb.png" width="200"/>](docs/assets/pencil.png)
+![Task-scheduled 3D FFT pipeline](docs/assets/pencil.png)
 
 > **Figure:** Task-scheduled 3D FFT pipeline (click to view full PDF).
 
