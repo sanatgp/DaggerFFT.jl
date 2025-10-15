@@ -1,6 +1,8 @@
 # DaggerFFT.jl
 Scalable distributed FFT implementation for heterogeneous CPU/GPU systems, built on Dagger.jl
 
+[pencil1_cropped (2).pdf](https://github.com/user-attachments/files/22937554/pencil1_cropped.2.pdf)
+
 ## Installation
 
 ```julia
