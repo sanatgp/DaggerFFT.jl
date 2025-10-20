@@ -10,6 +10,35 @@ using MPI
 
 import MPI: Comm_rank, Comm_size
 
+const R2R_SUPPORTED_KINDS = (
+    FFTW.DHT,
+    FFTW.REDFT00,
+    FFTW.REDFT01,
+    FFTW.REDFT10,
+    FFTW.REDFT11,
+    FFTW.RODFT00,
+    FFTW.RODFT01,
+    FFTW.RODFT10,
+    FFTW.RODFT11,
+)
+
+"""
+DHT (Discrete Hartley Transform):
+The DHT is its own inverse, so forward and backward are the same.
+
+REDFT (Real Even Discrete Fourier Transform):
+REDFT00 (Type I DCT): Its own inverse (symmetric)
+REDFT10 (Type II DCT): Forward transform
+REDFT01 (Type III DCT): Backward transform (inverse of REDFT10)
+REDFT11 (Type IV DCT): Its own inverse (symmetric)
+
+RODFT (Real Odd Discrete Fourier Transform):
+RODFT00 (Type I DST): Its own inverse (symmetric)
+RODFT10 (Type II DST): Forward transform
+RODFT01 (Type III DST): Backward transform (inverse of RODFT10)
+RODFT11 (Type IV DST): Its own inverse (symmetric)
+"""
+
 abstract type Decomposition end
 struct Pencil <: Decomposition end
 struct Slab <: Decomposition end
@@ -131,12 +160,8 @@ end
 function plan_transform(transform, A, dims; kwargs...)
     flags = get(kwargs, :flags, FFTW.MEASURE)
     
-    if transform isa RFFT
-        return FFTW.plan_rfft(A, dims; flags=flags, kwargs...)
-    elseif transform isa FFT
+    if transform isa FFT
         return FFTW.plan_fft(A, dims; flags=flags, kwargs...)
-    elseif transform isa IRFFT
-        return FFTW.plan_irfft(A, size(A, first(dims)), dims; flags=flags, kwargs...)
     elseif transform isa IFFT
         return FFTW.plan_ifft(A, dims; flags=flags, kwargs...)
     elseif transform isa RFFT!
@@ -147,6 +172,16 @@ function plan_transform(transform, A, dims; kwargs...)
         return FFTW.plan_irfft!(A, size(A, first(dims)), dims; flags=flags, kwargs...)
     elseif transform isa IFFT!
         return FFTW.plan_ifft!(A, dims; flags=flags, kwargs...)
+    else
+        throw(ArgumentError("Unknown transform type"))
+    end
+end
+
+function plan_transform(transform, A, dims, n; kwargs...)
+    if transform isa RFFT
+        return plan_rfft(A, dims; kwargs...)
+    elseif transform isa IRFFT
+        return plan_irfft(A, n, dims; kwargs...)
     else
         throw(ArgumentError("Unknown transform type"))
     end
@@ -662,8 +697,12 @@ function generate_tag(peer_rank::Int, phase_id::Int)
     return 1000 + phase_id * 97 + (peer_rank & 0x3FFF)
 end
 
+<<<<<<< HEAD
 
 function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
+=======
+function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{FFT,RFFT,R2R}},
+>>>>>>> aa2f60d (R2R)
               workspace_AB::FFTWorkspace{T}, workspace_BC::FFTWorkspace{T},
               transforms, dims) where T
     
@@ -674,9 +713,17 @@ function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
             @spawn apply_fft!(A.chunks[idx], In(transforms[1]), In(dims[1]))
         end
     end
+<<<<<<< HEAD
     
     coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
     
+=======
+    end
+        NVTX.@range "Redistribute 1" begin
+        coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
+    end
+    NVTX.@range "DIM 2" begin
+>>>>>>> aa2f60d (R2R)
     Dagger.spawn_datadeps(scheduler=:dynamic,
               enable_continuous_stealing=true,
               steal_threshold_ms=3.0) do
@@ -684,9 +731,17 @@ function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
             @spawn apply_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
         end
     end
+<<<<<<< HEAD
     
     coalesced_redistribute!(C, B, workspace_BC; phase_id=2)
     
+=======
+    end
+        NVTX.@range "Redistribute 2" begin
+        coalesced_redistribute!(C, B, workspace_BC; phase_id=2)
+    end
+    NVTX.@range "DIM 3" begin
+>>>>>>> aa2f60d (R2R)
     Dagger.spawn_datadeps(scheduler=:dynamic,
               enable_continuous_stealing=true,
               steal_threshold_ms=3.0) do
@@ -698,7 +753,7 @@ function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
     return C
 end
 
-function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
+function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{IFFT,IRFFT,R2R}},
                workspace_AB::FFTWorkspace{T}, workspace_BC::FFTWorkspace{T},
                transforms, dims) where T
     
@@ -708,15 +763,26 @@ function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
         for idx in eachindex(A.chunks)
             @spawn apply_fft!(A.chunks[idx], In(transforms[3]), In(dims[3]))
         end
+        if transforms[3] isa R2R
+            A ./= (2 * size(A, dims[3]))
+        end
     end
     
     coalesced_redistribute!(B, A, workspace_AB; phase_id=3)
     
     Dagger.spawn_datadeps(scheduler=:dynamic,
+<<<<<<< HEAD
                 enable_continuous_stealing=true,
                 steal_threshold_ms=3.0) do
+=======
+                         enable_continuous_stealing=true,
+                         steal_threshold_ms=3.0) do
+>>>>>>> aa2f60d (R2R)
         for idx in eachindex(B.chunks)
             @spawn apply_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
+        end
+        if transforms[2] isa R2R
+            B ./= (2 * size(B, dims[3]))
         end
     end
     
@@ -727,6 +793,9 @@ function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
                steal_threshold_ms=3.0) do
         for idx in eachindex(C.chunks)
             @spawn apply_fft!(C.chunks[idx], In(transforms[1]), In(dims[1]))
+        end
+        if transforms[1] isa R2R
+            C ./= (2 * size(C, dims[1]))
         end
     end
     
@@ -744,9 +813,16 @@ function fft!(B::DArray{T,3}, A::DArray{T,3},
             @spawn apply_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
         end
     end
+<<<<<<< HEAD
     
     coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
     
+=======
+    end
+    NVTX.@range "Redistribute 1" begin
+        coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
+    end
+>>>>>>> aa2f60d (R2R)
     Dagger.spawn_datadeps(scheduler=:dynamic,
                 enable_continuous_stealing=true,
                 steal_threshold_ms=3.0) do
@@ -768,6 +844,9 @@ function ifft!(A::DArray{T,3}, B::DArray{T,3},
         for idx in eachindex(B.chunks)
             @spawn apply_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
         end
+        if transforms[3] isa R2R
+            B ./= (2 * size(B, dims[3]))
+        end
     end
     
     coalesced_redistribute!(A, B, workspace_BA; phase_id=3)
@@ -777,6 +856,9 @@ function ifft!(A::DArray{T,3}, B::DArray{T,3},
                 steal_threshold_ms=3.0) do        
         for idx in eachindex(A.chunks)
             @spawn apply_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
+        end
+        if transforms[1] isa R2R
+            A ./= (2 * size(A, dims[1]) * size(A, dims[2]))
         end
     end
     

@@ -13,6 +13,36 @@ using GPUArraysCore
 using NVTX
 import MPI: Comm_rank, Comm_size
 
+
+const R2R_SUPPORTED_KINDS = (
+    FFTW.DHT,
+    FFTW.REDFT00,
+    FFTW.REDFT01,
+    FFTW.REDFT10,
+    FFTW.REDFT11,
+    FFTW.RODFT00,
+    FFTW.RODFT01,
+    FFTW.RODFT10,
+    FFTW.RODFT11,
+)
+
+"""
+DHT (Discrete Hartley Transform):
+The DHT is its own inverse, so forward and backward are the same.
+
+REDFT (Real Even Discrete Fourier Transform):
+REDFT00 (Type I DCT): Its own inverse (symmetric)
+REDFT10 (Type II DCT): Forward transform
+REDFT01 (Type III DCT): Backward transform (inverse of REDFT10)
+REDFT11 (Type IV DCT): Its own inverse (symmetric)
+
+RODFT (Real Odd Discrete Fourier Transform):
+RODFT00 (Type I DST): Its own inverse (symmetric)
+RODFT10 (Type II DST): Forward transform
+RODFT01 (Type III DST): Backward transform (inverse of RODFT10)
+RODFT11 (Type IV DST): Its own inverse (symmetric)
+"""
+
 abstract type Decomposition end
 struct Pencil <: Decomposition end
 struct Slab <: Decomposition end
@@ -704,7 +734,60 @@ function unpack_peer!(info::PeerCommInfo{T}, cache::Dict{Int,Any}) where T
     return ev
 end
 
+<<<<<<< HEAD
 function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
+=======
+
+function pack_kernel!(send_buffer, src, xs, ys, zs, nx, ny, nz, offset)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    
+    if idx <= nx * ny * nz
+        k = div(idx - 1, nx * ny)
+        rem = (idx - 1) % (nx * ny)
+        j = div(rem, nx)
+        i = rem % nx
+        
+        send_buffer[offset + idx] = src[xs + i, ys + j, zs + k]
+    end
+    
+    return nothing
+end
+
+
+function unpack_kernel!(dst, recv_buffer, xs, ys, zs, nx, ny, nz, offset)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    
+    if idx <= nx * ny * nz
+        k = div(idx - 1, nx * ny)
+        rem = (idx - 1) % (nx * ny)
+        j = div(rem, nx)
+        i = rem % nx
+        
+        dst[xs + i, ys + j, zs + k] = recv_buffer[offset + idx]
+    end
+    
+    return nothing
+end
+
+
+function local_copy_kernel!(dst, src, dst_xs, dst_ys, dst_zs, src_xs, src_ys, src_zs, nx, ny, nz)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    
+    if idx <= nx * ny * nz
+        k = div(idx - 1, nx * ny)
+        rem = (idx - 1) % (nx * ny)
+        j = div(rem, nx)
+        i = rem % nx
+        
+        dst[dst_xs + i, dst_ys + j, dst_zs + k] = src[src_xs + i, src_ys + j, src_zs + k]
+    end
+    
+    return nothing
+end
+
+
+function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{FFT,RFFT,R2R}},
+>>>>>>> aa2f60d (R2R)
               workspace_AB::CoalescedWorkspace{T}, workspace_BC::CoalescedWorkspace{T},
               scope, transforms, dims, ::Pencil) where T
     
@@ -739,7 +822,7 @@ function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
     return C
 end
 
-function fft!(B::DArray{T,3}, A::DArray{T,3},
+function fft!(B::DArray{T,3}, A::DArray{T,3}, transforms::NTuple{<:Any,Union{FFT,RFFT,R2R}},
               workspace_AB::CoalescedWorkspace{T},
               scope, transforms, dims, ::Slab) where T
     
@@ -764,7 +847,7 @@ function fft!(B::DArray{T,3}, A::DArray{T,3},
     return B
 end
 
-function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
+function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{IFFT,IRFFT,R2R}},
                workspace_AB::CoalescedWorkspace{T}, workspace_BC::CoalescedWorkspace{T},
                scope, transforms, dims, ::Pencil) where T
     
@@ -773,6 +856,9 @@ function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
             for idx in eachindex(A.chunks)
                 @spawn apply_gpu_fft!(A.chunks[idx], In(transforms[3]), In(dims[3]))
             end
+        end
+        if transforms[3] isa R2R
+            A ./= (2 * size(A, dims[3]))
         end
     end
     
@@ -784,6 +870,9 @@ function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
                 @spawn apply_gpu_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
             end
         end
+        if transforms[2] isa R2R
+            B ./= (2 * size(B, dims[2]))
+        end
     end
     
     coalesced_redistribute!(C, B, workspace_BC; phase_id=4)
@@ -794,12 +883,15 @@ function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
                 @spawn apply_gpu_fft!(C.chunks[idx], In(transforms[1]), In(dims[1]))
             end
         end
+        if transforms[1] isa R2R
+            C ./= (2 * size(C, dims[1]))
+        end
     end
     
     return C
 end
 
-function ifft!(A::DArray{T,3}, B::DArray{T,3},
+function ifft!(A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{IFFT,IRFFT,R2R}},
                workspace_BA::CoalescedWorkspace{T},
                scope, transforms, dims, ::Slab) where T
     
@@ -808,6 +900,9 @@ function ifft!(A::DArray{T,3}, B::DArray{T,3},
             for idx in eachindex(B.chunks)
                 @spawn apply_gpu_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
             end
+        end
+        if transforms[3] isa R2R
+            B ./= (2 * size(B, dims[3]))
         end
     end
     
@@ -819,6 +914,9 @@ function ifft!(A::DArray{T,3}, B::DArray{T,3},
             for idx in eachindex(A.chunks)
                 @spawn apply_gpu_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
             end
+        end
+        if transforms[1] isa R2R
+            A ./= (2 * size(A, dims[1]) * size(A, dims[2]))
         end
     end
     
