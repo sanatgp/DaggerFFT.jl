@@ -62,7 +62,7 @@ F = fft(A; decomp=Slab(), transforms=(R2R((FFTW.REDFT10, FFTW.REDFT10)),), dims=
 A_recon = ifft(F; decomp=Slab(), transforms=(R2R((FFTW.REDFT01, FFTW.REDFT01)),), dims=(1,2))
 ```
 
-
+```julia
 @article{anvari2026daggerfft,
   title   = {DaggerFFT: A Distributed FFT Framework Using Task Scheduling in Julia},
   author  = {Anvari, Sana Taghipour and Samaroo, Julian and Raayai Ardakani, Matin and Kaeli, David},
@@ -70,4 +70,4 @@ A_recon = ifft(F; decomp=Slab(), transforms=(R2R((FFTW.REDFT01, FFTW.REDFT01)),)
   year    = {2026},
   doi     = {10.48550/arXiv.2601.12209}
 }
-
+```
