@@ -1,4 +1,3 @@
-# DaggerGPUFFTs.jl 
 module DaggerGPUFFTs
 
 using AbstractFFTs
@@ -8,7 +7,7 @@ import Dagger: Chunk, DArray, @spawn, InOut, In, memory_space, move!, move
 using Dagger
 using KernelAbstractions
 using MPI
-#using DaggerGPU
+using DaggerGPU
 using CUDA
 using GPUArraysCore
 using NVTX
@@ -120,6 +119,45 @@ function detect_hierarchical_topology(; gpus_per_node::Int=0)::HierarchicalInfo
     
     return HierarchicalInfo(node_rank, local_rank, gpus_per_node, total_nodes,
                            is_aggregator, node_comm, inter_comm)
+end
+
+function pack_kernel!(peer_buffer, src, xs, ys, zs, nx, ny, nz, off)
+    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
+    total = nx*ny*nz
+    if i <= total
+        k = (i-1) ÷ (nx*ny)
+        t = (i-1) % (nx*ny)
+        j = t ÷ nx
+        ii = t % nx
+        peer_buffer[off + i] = @inbounds src[xs+ii, ys+j, zs+k]
+    end
+    return
+end
+
+function unpack_kernel!(dst, peer_buffer, xs, ys, zs, nx, ny, nz, off)
+    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
+    total = nx*ny*nz
+    if i <= total
+        k = (i-1) ÷ (nx*ny)
+        t = (i-1) % (nx*ny)
+        j = t ÷ nx
+        ii = t % nx
+        @inbounds dst[xs+ii, ys+j, zs+k] = peer_buffer[off + i]
+    end
+    return
+end
+
+function local_copy_kernel!(dst, src, dst_xs, dst_ys, dst_zs, src_xs, src_ys, src_zs, nx, ny, nz)
+    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
+    total = nx*ny*nz
+    if i <= total
+        k = (i-1) ÷ (nx*ny)
+        t = (i-1) % (nx*ny)
+        j = t ÷ nx
+        ii = t % nx
+        @inbounds dst[dst_xs+ii, dst_ys+j, dst_zs+k] = src[src_xs+ii, src_ys+j, src_zs+k]
+    end
+    return
 end
 
 @inline function launch_1d!(f, n, stream, threads, args...)
@@ -378,7 +416,6 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::Coale
     rank = Comm_rank(comm)
     
     NVTX.@range "FLAT_REDISTRIBUTE" begin
-        
         NVTX.@range "CACHE_CHUNKS" begin
             workspace.chunk_cache = Dict{Int, Any}()
             
@@ -404,12 +441,14 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::Coale
         end
         
         NVTX.@range "PACK_SEND" begin
+            pack_done = Dict{Int, CUDA.CuEvent}()
             for dst_rank in workspace.send_ranks
                 peer_info = workspace.send_peers[dst_rank]
-                pack_peer!(peer_info, workspace.chunk_cache)
+                pack_done[dst_rank] = pack_peer!(peer_info, workspace.chunk_cache)
             end
             
             for (i, dst_rank) in enumerate(workspace.send_ranks)
+                CUDA.synchronize(pack_done[dst_rank])
                 tag = generate_tag(rank, phase_id)
                 peer_info = workspace.send_peers[dst_rank]
                 workspace.send_reqs[i] = MPI.Isend(peer_info.send_buffer, dst_rank, tag, comm)
@@ -447,9 +486,7 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::Coale
                         if flag
                             src_rank = workspace.recv_ranks[i]
                             peer_info = workspace.recv_peers[src_rank]
-                            
                             unpack_peer!(peer_info, workspace.chunk_cache)
-                            
                             delete!(remaining, i)
                         end
                     else
@@ -461,98 +498,211 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::Coale
                     yield()
                 end
             end
-            
         end
         
+        NVTX.@range "WAIT_SENDS" begin
+            for i in 1:length(workspace.send_reqs)
+                MPI.Wait!(workspace.send_reqs[i])
+            end
+        end
     end
 end
 
+function hierarchical_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::CoalescedWorkspace{T}, phase_id::Int) where T
+    hierarchical = workspace.hierarchical
+    comm = MPI.COMM_WORLD
+    rank = Comm_rank(comm)
+    
+    NVTX.@range "HIERARCHICAL_REDISTRIBUTE" begin
+        NVTX.@range "CACHE_CHUNKS" begin
+            workspace.chunk_cache = Dict{Int, Any}()
+            
+            for (idx, chunk) in enumerate(src.chunks)
+                if chunk.handle.rank == rank
+                    workspace.chunk_cache[idx] = fetch(chunk)
+                end
+            end
+            
+            for (idx, chunk) in enumerate(dst.chunks)
+                if chunk.handle.rank == rank
+                    workspace.chunk_cache[idx + 1000] = fetch(chunk)
+                end
+            end
+        end
+        
+        NVTX.@range "INTRA_NODE_AGGREGATION" begin
+            for (target_node, patterns) in workspace.intra_send_patterns
+                if haskey(workspace.node_send_buffers, target_node)
+                    node_buffer = workspace.node_send_buffers[target_node]
+                    
+                    for pattern in patterns
+                        if haskey(workspace.chunk_cache, pattern.src_idx)
+                            src = workspace.chunk_cache[pattern.src_idx]::CuArray{T,3}
+                            nx, ny, nz = length.(pattern.src_indices)
+                            xs, ys, zs = first.(pattern.src_indices)
+                            
+                            launch_1d!(pack_kernel!, pattern.buffer_size, CUDA.default_stream(), 256,
+                                      node_buffer, src, xs, ys, zs, nx, ny, nz, pattern.buffer_offset)
+                        end
+                    end
+                end
+            end
+            
+            MPI.Barrier(hierarchical.node_comm)
+        end
+        
+        # Inter-node communication (aggregators only)
+        NVTX.@range "INTER_NODE_COMMUNICATION" begin
+            if hierarchical.is_aggregator
+                for (i, source_node) in enumerate(workspace.source_nodes)
+                    if haskey(workspace.node_recv_buffers, source_node)
+                        node_buffer = workspace.node_recv_buffers[source_node]
+                        source_aggregator = source_node * hierarchical.gpus_per_node 
+                        tag = generate_tag(source_aggregator, phase_id + 100)
+                        workspace.node_recv_reqs[i] = MPI.Irecv!(node_buffer, source_aggregator, tag, comm)
+                    end
+                end
+                
+                for (i, target_node) in enumerate(workspace.target_nodes)
+                    if haskey(workspace.node_send_buffers, target_node)
+                        node_buffer = workspace.node_send_buffers[target_node]
+                        target_aggregator = target_node * hierarchical.gpus_per_node  
+                        tag = generate_tag(rank, phase_id + 100)
+                        workspace.node_send_reqs[i] = MPI.Isend(node_buffer, target_aggregator, tag, comm)
+                    end
+                end
+                
+                for i in 1:length(workspace.source_nodes)
+                    MPI.Wait!(workspace.node_recv_reqs[i])
+                end
+                
+                for i in 1:length(workspace.target_nodes)
+                    MPI.Wait!(workspace.node_send_reqs[i])
+                end
+            end
+            
+            MPI.Barrier(hierarchical.node_comm)
+        end
+        
+        NVTX.@range "INTRA_NODE_DISTRIBUTION" begin
+            if hierarchical.is_aggregator
+                for (source_node, patterns) in workspace.intra_recv_patterns
+                    if haskey(workspace.node_recv_buffers, source_node)
+                        node_buffer = workspace.node_recv_buffers[source_node]
+                        
+                        for pattern in patterns
+                            dst_key = pattern.dst_idx + 1000
+                            if haskey(workspace.chunk_cache, dst_key)
+                                dst = workspace.chunk_cache[dst_key]::CuArray{T,3}
+                                nx, ny, nz = length.(pattern.dst_indices)
+                                xs, ys, zs = first.(pattern.dst_indices)
+                                
+                                launch_1d!(unpack_kernel!, pattern.buffer_size, CUDA.default_stream(), 256,
+                                          dst, node_buffer, xs, ys, zs, nx, ny, nz, pattern.buffer_offset)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        # Peer-to-peer (within-node) communication
+        NVTX.@range "PEER_COMMUNICATION" begin
+            for (i, src_rank) in enumerate(workspace.recv_ranks)
+                peer_info = workspace.recv_peers[src_rank]
+                tag = generate_tag(src_rank, phase_id)
+                workspace.recv_reqs[i] = MPI.Irecv!(peer_info.recv_buffer, src_rank, tag, comm)
+            end
+            
+            pack_done = Dict{Int, CUDA.CuEvent}()
+            for dst_rank in workspace.send_ranks
+                peer_info = workspace.send_peers[dst_rank]
+                pack_done[dst_rank] = pack_peer!(peer_info, workspace.chunk_cache)
+            end
+            
+            for (i, dst_rank) in enumerate(workspace.send_ranks)
+                CUDA.synchronize(pack_done[dst_rank])
+                tag = generate_tag(rank, phase_id)
+                peer_info = workspace.send_peers[dst_rank]
+                workspace.send_reqs[i] = MPI.Isend(peer_info.send_buffer, dst_rank, tag, comm)
+            end
+            
+            remaining = Set(1:length(workspace.recv_ranks))
+            while !isempty(remaining)
+                for i in copy(remaining)
+                    flag, _ = MPI.Test!(workspace.recv_reqs[i])
+                    if flag
+                        src_rank = workspace.recv_ranks[i]
+                        peer_info = workspace.recv_peers[src_rank]
+                        unpack_peer!(peer_info, workspace.chunk_cache)
+                        delete!(remaining, i)
+                    end
+                end
+                if !isempty(remaining)
+                    yield()
+                end
+            end
+            
+            for i in 1:length(workspace.send_ranks)
+                MPI.Wait!(workspace.send_reqs[i])
+            end
+        end
+        
+        # Local copies
+        NVTX.@range "LOCAL_COPIES" begin
+            for pattern in workspace.local_patterns
+                src_key = pattern.src_idx
+                dst_key = pattern.dst_idx + 1000
+                
+                if haskey(workspace.chunk_cache, src_key) && haskey(workspace.chunk_cache, dst_key)
+                    src_data = workspace.chunk_cache[src_key]
+                    dst_data = workspace.chunk_cache[dst_key]
+                    
+                    nx, ny, nz = length.(pattern.dst_indices)
+                    dst_xs, dst_ys, dst_zs = first.(pattern.dst_indices)
+                    src_xs, src_ys, src_zs = first.(pattern.src_indices)
+                    
+                    launch_1d!(local_copy_kernel!, pattern.buffer_size, CUDA.default_stream(), 256,
+                              dst_data, src_data, dst_xs, dst_ys, dst_zs, 
+                              src_xs, src_ys, src_zs, nx, ny, nz)
+                end
+            end
+        end
+    end
+end
 
 function pack_peer!(info::PeerCommInfo{T}, cache::Dict{Int,Any}) where T
     s = info.send_stream
-    
     for pat in info.patterns
         if haskey(cache, pat.src_idx)
             src = cache[pat.src_idx]::CuArray{T,3}
             nx, ny, nz = length.(pat.src_indices)
             xs, ys, zs = first.(pat.src_indices)
-            
             launch_1d!(pack_kernel!, pat.buffer_size, s, 256,
                       info.send_buffer, src, xs, ys, zs, nx, ny, nz, pat.buffer_offset)
         end
     end
-    
-    return nothing
+    ev = CUDA.CuEvent()
+    CUDA.record(ev, s)
+    return ev
 end
-
 
 function unpack_peer!(info::PeerCommInfo{T}, cache::Dict{Int,Any}) where T
     s = info.recv_stream
-    
-    # Launch kernels asynchronously - NO synchronization
     for pat in info.patterns
         dst_key = pat.dst_idx + 1000
         if haskey(cache, dst_key)
             dst = cache[dst_key]::CuArray{T,3}
             nx, ny, nz = length.(pat.dst_indices)
             xs, ys, zs = first.(pat.dst_indices)
-            
             launch_1d!(unpack_kernel!, pat.buffer_size, s, 256,
                       dst, info.recv_buffer, xs, ys, zs, nx, ny, nz, pat.buffer_offset)
         end
     end
-    
-    return nothing
+    ev = CUDA.CuEvent()
+    CUDA.record(ev, s)
+    return ev
 end
-
-
-function pack_kernel!(send_buffer, src, xs, ys, zs, nx, ny, nz, offset)
-    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    
-    if idx <= nx * ny * nz
-        k = div(idx - 1, nx * ny)
-        rem = (idx - 1) % (nx * ny)
-        j = div(rem, nx)
-        i = rem % nx
-        
-        send_buffer[offset + idx] = src[xs + i, ys + j, zs + k]
-    end
-    
-    return nothing
-end
-
-
-function unpack_kernel!(dst, recv_buffer, xs, ys, zs, nx, ny, nz, offset)
-    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    
-    if idx <= nx * ny * nz
-        k = div(idx - 1, nx * ny)
-        rem = (idx - 1) % (nx * ny)
-        j = div(rem, nx)
-        i = rem % nx
-        
-        dst[xs + i, ys + j, zs + k] = recv_buffer[offset + idx]
-    end
-    
-    return nothing
-end
-
-
-function local_copy_kernel!(dst, src, dst_xs, dst_ys, dst_zs, src_xs, src_ys, src_zs, nx, ny, nz)
-    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    
-    if idx <= nx * ny * nz
-        k = div(idx - 1, nx * ny)
-        rem = (idx - 1) % (nx * ny)
-        j = div(rem, nx)
-        i = rem % nx
-        
-        dst[dst_xs + i, dst_ys + j, dst_zs + k] = src[src_xs + i, src_ys + j, src_zs + k]
-    end
-    
-    return nothing
-end
-
 
 function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
               workspace_AB::CoalescedWorkspace{T}, workspace_BC::CoalescedWorkspace{T},
@@ -663,6 +813,7 @@ function ifft!(A::DArray{T,3}, B::DArray{T,3},
     
     coalesced_redistribute!(A, B, workspace_BA; phase_id=3)
     
+    # Last two dimensions done locally (no communication)
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(A.chunks)
@@ -748,9 +899,7 @@ function Base.similar(x::DArray{T,N}) where {T,N}
 end
 
 function cleanup_workspace!(workspace::CoalescedWorkspace)
-    # Clear the chunk cache
     empty!(workspace.chunk_cache)
-    
     CUDA.reclaim()
     
 end
