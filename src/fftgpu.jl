@@ -1,88 +1,10 @@
-module DaggerGPUFFTs
+# fftgpu.jl - GPU FFT implementations for DaggerFFT
+# No module wrapper - included directly into DaggerFFT module
+# Types shared with fft.jl (Decomposition, Pencil, Slab, FFT, FFT!, etc.) are NOT redefined here
+# Types shared with fft.jl (CoalescedPattern, HierarchicalInfo, compute_overlap, generate_tag) are NOT redefined here
 
-using AbstractFFTs
-using LinearAlgebra
-using Dagger: DArray, @spawn, InOut, In
-import Dagger: Chunk, DArray, @spawn, InOut, In, memory_space, move!, move
-using Dagger
-using KernelAbstractions
-using MPI
-using DaggerGPU
-using CUDA
-using GPUArraysCore
-using NVTX
-import MPI: Comm_rank, Comm_size
-
-
-const R2R_SUPPORTED_KINDS = (
-    FFTW.DHT,
-    FFTW.REDFT00,
-    FFTW.REDFT01,
-    FFTW.REDFT10,
-    FFTW.REDFT11,
-    FFTW.RODFT00,
-    FFTW.RODFT01,
-    FFTW.RODFT10,
-    FFTW.RODFT11,
-)
-
-"""
-DHT (Discrete Hartley Transform):
-The DHT is its own inverse, so forward and backward are the same.
-
-REDFT (Real Even Discrete Fourier Transform):
-REDFT00 (Type I DCT): Its own inverse (symmetric)
-REDFT10 (Type II DCT): Forward transform
-REDFT01 (Type III DCT): Backward transform (inverse of REDFT10)
-REDFT11 (Type IV DCT): Its own inverse (symmetric)
-
-RODFT (Real Odd Discrete Fourier Transform):
-RODFT00 (Type I DST): Its own inverse (symmetric)
-RODFT10 (Type II DST): Forward transform
-RODFT01 (Type III DST): Backward transform (inverse of RODFT10)
-RODFT11 (Type IV DST): Its own inverse (symmetric)
-"""
-
-abstract type Decomposition end
-struct Pencil <: Decomposition end
-struct Slab <: Decomposition end
-
-struct FFT end
-struct RFFT end
-struct IRFFT end
-struct IFFT end
-struct FFT! end
-struct RFFT! end
-struct IRFFT! end
-struct IFFT! end
-
-export FFT, RFFT, IRFFT, IFFT, FFT!, RFFT!, IRFFT!, IFFT!, fft, ifft
-export GPUFFTWorkspace, create_gpu_workspace, fft!, ifft!
-export Pencil, Slab
-
-struct HierarchicalInfo
-    node_rank::Int
-    local_rank::Int
-    gpus_per_node::Int
-    total_nodes::Int
-    is_aggregator::Bool
-    
-    node_comm::MPI.Comm
-    inter_comm::MPI.Comm
-end
-
-struct CoalescedPattern
-    src_idx::Int
-    dst_idx::Int
-    overlap::NTuple{3, UnitRange{Int}}
-    src_indices::NTuple{3, UnitRange{Int}}
-    dst_indices::NTuple{3, UnitRange{Int}}
-    buffer_offset::Int
-    buffer_size::Int
-    target_node::Int
-end
-
-struct PeerCommInfo{T}
+# GPU-specific peer communication info (uses CuArray buffers and CUDA streams)
+struct GPUPeerCommInfo{T}
     peer_rank::Int
     total_size::Int
     patterns::Vector{CoalescedPattern}
@@ -93,8 +15,8 @@ struct PeerCommInfo{T}
 end
 
 mutable struct CoalescedWorkspace{T}
-    send_peers::Dict{Int, PeerCommInfo{T}}
-    recv_peers::Dict{Int, PeerCommInfo{T}}
+    send_peers::Dict{Int, GPUPeerCommInfo{T}}
+    recv_peers::Dict{Int, GPUPeerCommInfo{T}}
     local_patterns::Vector{CoalescedPattern}
     
     hierarchical::Union{HierarchicalInfo, Nothing}
@@ -124,7 +46,9 @@ mutable struct CoalescedWorkspace{T}
     end
 end
 
-function detect_hierarchical_topology(; gpus_per_node::Int=0)::HierarchicalInfo
+const GPUFFTWorkspace = CoalescedWorkspace
+
+function detect_gpu_hierarchical_topology(; gpus_per_node::Int=0)::HierarchicalInfo
     comm = MPI.COMM_WORLD
     rank = Comm_rank(comm)
     nranks = Comm_size(comm)
@@ -151,45 +75,6 @@ function detect_hierarchical_topology(; gpus_per_node::Int=0)::HierarchicalInfo
                            is_aggregator, node_comm, inter_comm)
 end
 
-function pack_kernel!(peer_buffer, src, xs, ys, zs, nx, ny, nz, off)
-    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
-    total = nx*ny*nz
-    if i <= total
-        k = (i-1) ÷ (nx*ny)
-        t = (i-1) % (nx*ny)
-        j = t ÷ nx
-        ii = t % nx
-        peer_buffer[off + i] = @inbounds src[xs+ii, ys+j, zs+k]
-    end
-    return
-end
-
-function unpack_kernel!(dst, peer_buffer, xs, ys, zs, nx, ny, nz, off)
-    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
-    total = nx*ny*nz
-    if i <= total
-        k = (i-1) ÷ (nx*ny)
-        t = (i-1) % (nx*ny)
-        j = t ÷ nx
-        ii = t % nx
-        @inbounds dst[xs+ii, ys+j, zs+k] = peer_buffer[off + i]
-    end
-    return
-end
-
-function local_copy_kernel!(dst, src, dst_xs, dst_ys, dst_zs, src_xs, src_ys, src_zs, nx, ny, nz)
-    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
-    total = nx*ny*nz
-    if i <= total
-        k = (i-1) ÷ (nx*ny)
-        t = (i-1) % (nx*ny)
-        j = t ÷ nx
-        ii = t % nx
-        @inbounds dst[dst_xs+ii, dst_ys+j, dst_zs+k] = src[src_xs+ii, src_ys+j, src_zs+k]
-    end
-    return
-end
-
 @inline function launch_1d!(f, n, stream, threads, args...)
     blocks = cld(n, threads)
     @cuda threads=threads blocks=blocks stream=stream f(args...)
@@ -197,7 +82,7 @@ end
 
 const GPU_PLAN_CACHE = Dict{Tuple{DataType, NTuple, Type, Tuple}, Any}()
 
-function plan_transform(transform, A::CuArray, dims; kwargs...)
+function gpu_plan_transform(transform, A::CuArray, dims; kwargs...)
     if transform isa RFFT
         return CUDA.CUFFT.plan_rfft(A, dims; kwargs...)
     elseif transform isa FFT
@@ -224,7 +109,7 @@ function get_or_create_gpu_plan(transform, A::CuArray, dims; kwargs...)
     key = (eltype(A), size(A), typeof(transform), dims_tuple)
     
     if !haskey(GPU_PLAN_CACHE, key)
-        GPU_PLAN_CACHE[key] = plan_transform(transform, A, dims; kwargs...)
+        GPU_PLAN_CACHE[key] = gpu_plan_transform(transform, A, dims; kwargs...)
     end
     
     return GPU_PLAN_CACHE[key]
@@ -256,7 +141,7 @@ function create_gpu_workspace(src::DArray{T,3}, dst::DArray{T,3};
     @assert current_device isa CUDA.CuDevice "No CUDA device available"
     
     hierarchical = if use_hierarchical && nranks > 1
-        detect_hierarchical_topology(gpus_per_node=gpus_per_node)
+        detect_gpu_hierarchical_topology(gpus_per_node=gpus_per_node)
     else
         nothing
     end
@@ -271,12 +156,12 @@ function create_gpu_workspace(src::DArray{T,3}, dst::DArray{T,3};
     for (dst_idx, dst_chunk) in enumerate(dst.chunks)
         dst_rank = dst_chunk.handle.rank
         dst_domain = dst.subdomains[dst_idx]
-        dst_node = hierarchical !== nothing ? dst_rank ÷ hierarchical.gpus_per_node : -1
+        dst_node = hierarchical !== nothing ? dst_rank ÷ hierarchical.ranks_per_node : -1
         
         for (src_idx, src_chunk) in enumerate(src.chunks)
             src_rank = src_chunk.handle.rank
             src_domain = src.subdomains[src_idx]
-            src_node = hierarchical !== nothing ? src_rank ÷ hierarchical.gpus_per_node : -1
+            src_node = hierarchical !== nothing ? src_rank ÷ hierarchical.ranks_per_node : -1
             
             overlap = compute_overlap(src_domain, dst_domain)
             
@@ -325,8 +210,8 @@ function create_gpu_workspace(src::DArray{T,3}, dst::DArray{T,3};
         end
     end
     
-    send_peers = Dict{Int, PeerCommInfo{T}}()
-    recv_peers = Dict{Int, PeerCommInfo{T}}()
+    send_peers = Dict{Int, GPUPeerCommInfo{T}}()
+    recv_peers = Dict{Int, GPUPeerCommInfo{T}}()
     
     for (peer_rank, pattern_list) in send_peer_patterns
         total_size = 0
@@ -343,7 +228,7 @@ function create_gpu_workspace(src::DArray{T,3}, dst::DArray{T,3};
         send_stream = CUDA.CuStream()
         recv_stream = CUDA.CuStream()
         
-        peer_info = PeerCommInfo{T}(peer_rank, total_size, patterns, send_buffer, nothing, 
+        peer_info = GPUPeerCommInfo{T}(peer_rank, total_size, patterns, send_buffer, nothing, 
                                    send_stream, recv_stream)
         send_peers[peer_rank] = peer_info
     end
@@ -363,7 +248,7 @@ function create_gpu_workspace(src::DArray{T,3}, dst::DArray{T,3};
         send_stream = CUDA.CuStream()
         recv_stream = CUDA.CuStream()
         
-        peer_info = PeerCommInfo{T}(peer_rank, total_size, patterns, nothing, recv_buffer,
+        peer_info = GPUPeerCommInfo{T}(peer_rank, total_size, patterns, nothing, recv_buffer,
                                    send_stream, recv_stream)
         recv_peers[peer_rank] = peer_info
     end
@@ -432,20 +317,16 @@ function create_gpu_workspace(src::DArray{T,3}, dst::DArray{T,3};
     return workspace
 end
 
-function coalesced_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::CoalescedWorkspace{T}; phase_id::Int=1) where T
-#    if workspace.use_hierarchical && workspace.hierarchical !== nothing
- #       hierarchical_redistribute!(dst, src, workspace, phase_id)
-#    else
-        flat_redistribute!(dst, src, workspace, phase_id)
-  #  end
-   # return nothing
+function gpu_coalesced_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::CoalescedWorkspace{T}; phase_id::Int=1) where T
+    gpu_flat_redistribute!(dst, src, workspace, phase_id)
 end
 
-function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::CoalescedWorkspace{T}, phase_id::Int) where T
+function gpu_flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::CoalescedWorkspace{T}, phase_id::Int) where T
     comm = MPI.COMM_WORLD
     rank = Comm_rank(comm)
     
     NVTX.@range "FLAT_REDISTRIBUTE" begin
+        
         NVTX.@range "CACHE_CHUNKS" begin
             workspace.chunk_cache = Dict{Int, Any}()
             
@@ -471,14 +352,12 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::Coale
         end
         
         NVTX.@range "PACK_SEND" begin
-            pack_done = Dict{Int, CUDA.CuEvent}()
             for dst_rank in workspace.send_ranks
                 peer_info = workspace.send_peers[dst_rank]
-                pack_done[dst_rank] = pack_peer!(peer_info, workspace.chunk_cache)
+                gpu_pack_peer!(peer_info, workspace.chunk_cache)
             end
             
             for (i, dst_rank) in enumerate(workspace.send_ranks)
-                CUDA.synchronize(pack_done[dst_rank])
                 tag = generate_tag(rank, phase_id)
                 peer_info = workspace.send_peers[dst_rank]
                 workspace.send_reqs[i] = MPI.Isend(peer_info.send_buffer, dst_rank, tag, comm)
@@ -516,7 +395,9 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::Coale
                         if flag
                             src_rank = workspace.recv_ranks[i]
                             peer_info = workspace.recv_peers[src_rank]
-                            unpack_peer!(peer_info, workspace.chunk_cache)
+                            
+                            gpu_unpack_peer!(peer_info, workspace.chunk_cache)
+                            
                             delete!(remaining, i)
                         end
                     else
@@ -530,213 +411,43 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::Coale
             end
         end
         
-        NVTX.@range "WAIT_SENDS" begin
-            for i in 1:length(workspace.send_reqs)
-                MPI.Wait!(workspace.send_reqs[i])
-            end
-        end
     end
 end
 
-function hierarchical_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::CoalescedWorkspace{T}, phase_id::Int) where T
-    hierarchical = workspace.hierarchical
-    comm = MPI.COMM_WORLD
-    rank = Comm_rank(comm)
-    
-    NVTX.@range "HIERARCHICAL_REDISTRIBUTE" begin
-        NVTX.@range "CACHE_CHUNKS" begin
-            workspace.chunk_cache = Dict{Int, Any}()
-            
-            for (idx, chunk) in enumerate(src.chunks)
-                if chunk.handle.rank == rank
-                    workspace.chunk_cache[idx] = fetch(chunk)
-                end
-            end
-            
-            for (idx, chunk) in enumerate(dst.chunks)
-                if chunk.handle.rank == rank
-                    workspace.chunk_cache[idx + 1000] = fetch(chunk)
-                end
-            end
-        end
-        
-        NVTX.@range "INTRA_NODE_AGGREGATION" begin
-            for (target_node, patterns) in workspace.intra_send_patterns
-                if haskey(workspace.node_send_buffers, target_node)
-                    node_buffer = workspace.node_send_buffers[target_node]
-                    
-                    for pattern in patterns
-                        if haskey(workspace.chunk_cache, pattern.src_idx)
-                            src = workspace.chunk_cache[pattern.src_idx]::CuArray{T,3}
-                            nx, ny, nz = length.(pattern.src_indices)
-                            xs, ys, zs = first.(pattern.src_indices)
-                            
-                            launch_1d!(pack_kernel!, pattern.buffer_size, CUDA.default_stream(), 256,
-                                      node_buffer, src, xs, ys, zs, nx, ny, nz, pattern.buffer_offset)
-                        end
-                    end
-                end
-            end
-            
-            MPI.Barrier(hierarchical.node_comm)
-        end
-        
-        # Inter-node communication (aggregators only)
-        NVTX.@range "INTER_NODE_COMMUNICATION" begin
-            if hierarchical.is_aggregator
-                for (i, source_node) in enumerate(workspace.source_nodes)
-                    if haskey(workspace.node_recv_buffers, source_node)
-                        node_buffer = workspace.node_recv_buffers[source_node]
-                        source_aggregator = source_node * hierarchical.gpus_per_node 
-                        tag = generate_tag(source_aggregator, phase_id + 100)
-                        workspace.node_recv_reqs[i] = MPI.Irecv!(node_buffer, source_aggregator, tag, comm)
-                    end
-                end
-                
-                for (i, target_node) in enumerate(workspace.target_nodes)
-                    if haskey(workspace.node_send_buffers, target_node)
-                        node_buffer = workspace.node_send_buffers[target_node]
-                        target_aggregator = target_node * hierarchical.gpus_per_node  
-                        tag = generate_tag(rank, phase_id + 100)
-                        workspace.node_send_reqs[i] = MPI.Isend(node_buffer, target_aggregator, tag, comm)
-                    end
-                end
-                
-                for i in 1:length(workspace.source_nodes)
-                    MPI.Wait!(workspace.node_recv_reqs[i])
-                end
-                
-                for i in 1:length(workspace.target_nodes)
-                    MPI.Wait!(workspace.node_send_reqs[i])
-                end
-            end
-            
-            MPI.Barrier(hierarchical.node_comm)
-        end
-        
-        NVTX.@range "INTRA_NODE_DISTRIBUTION" begin
-            if hierarchical.is_aggregator
-                for (source_node, patterns) in workspace.intra_recv_patterns
-                    if haskey(workspace.node_recv_buffers, source_node)
-                        node_buffer = workspace.node_recv_buffers[source_node]
-                        
-                        for pattern in patterns
-                            dst_key = pattern.dst_idx + 1000
-                            if haskey(workspace.chunk_cache, dst_key)
-                                dst = workspace.chunk_cache[dst_key]::CuArray{T,3}
-                                nx, ny, nz = length.(pattern.dst_indices)
-                                xs, ys, zs = first.(pattern.dst_indices)
-                                
-                                launch_1d!(unpack_kernel!, pattern.buffer_size, CUDA.default_stream(), 256,
-                                          dst, node_buffer, xs, ys, zs, nx, ny, nz, pattern.buffer_offset)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        
-        # Peer-to-peer (within-node) communication
-        NVTX.@range "PEER_COMMUNICATION" begin
-            for (i, src_rank) in enumerate(workspace.recv_ranks)
-                peer_info = workspace.recv_peers[src_rank]
-                tag = generate_tag(src_rank, phase_id)
-                workspace.recv_reqs[i] = MPI.Irecv!(peer_info.recv_buffer, src_rank, tag, comm)
-            end
-            
-            pack_done = Dict{Int, CUDA.CuEvent}()
-            for dst_rank in workspace.send_ranks
-                peer_info = workspace.send_peers[dst_rank]
-                pack_done[dst_rank] = pack_peer!(peer_info, workspace.chunk_cache)
-            end
-            
-            for (i, dst_rank) in enumerate(workspace.send_ranks)
-                CUDA.synchronize(pack_done[dst_rank])
-                tag = generate_tag(rank, phase_id)
-                peer_info = workspace.send_peers[dst_rank]
-                workspace.send_reqs[i] = MPI.Isend(peer_info.send_buffer, dst_rank, tag, comm)
-            end
-            
-            remaining = Set(1:length(workspace.recv_ranks))
-            while !isempty(remaining)
-                for i in copy(remaining)
-                    flag, _ = MPI.Test!(workspace.recv_reqs[i])
-                    if flag
-                        src_rank = workspace.recv_ranks[i]
-                        peer_info = workspace.recv_peers[src_rank]
-                        unpack_peer!(peer_info, workspace.chunk_cache)
-                        delete!(remaining, i)
-                    end
-                end
-                if !isempty(remaining)
-                    yield()
-                end
-            end
-            
-            for i in 1:length(workspace.send_ranks)
-                MPI.Wait!(workspace.send_reqs[i])
-            end
-        end
-        
-        # Local copies
-        NVTX.@range "LOCAL_COPIES" begin
-            for pattern in workspace.local_patterns
-                src_key = pattern.src_idx
-                dst_key = pattern.dst_idx + 1000
-                
-                if haskey(workspace.chunk_cache, src_key) && haskey(workspace.chunk_cache, dst_key)
-                    src_data = workspace.chunk_cache[src_key]
-                    dst_data = workspace.chunk_cache[dst_key]
-                    
-                    nx, ny, nz = length.(pattern.dst_indices)
-                    dst_xs, dst_ys, dst_zs = first.(pattern.dst_indices)
-                    src_xs, src_ys, src_zs = first.(pattern.src_indices)
-                    
-                    launch_1d!(local_copy_kernel!, pattern.buffer_size, CUDA.default_stream(), 256,
-                              dst_data, src_data, dst_xs, dst_ys, dst_zs, 
-                              src_xs, src_ys, src_zs, nx, ny, nz)
-                end
-            end
-        end
-    end
-end
-
-function pack_peer!(info::PeerCommInfo{T}, cache::Dict{Int,Any}) where T
+function gpu_pack_peer!(info::GPUPeerCommInfo{T}, cache::Dict{Int,Any}) where T
     s = info.send_stream
+    
     for pat in info.patterns
         if haskey(cache, pat.src_idx)
             src = cache[pat.src_idx]::CuArray{T,3}
             nx, ny, nz = length.(pat.src_indices)
             xs, ys, zs = first.(pat.src_indices)
+            
             launch_1d!(pack_kernel!, pat.buffer_size, s, 256,
                       info.send_buffer, src, xs, ys, zs, nx, ny, nz, pat.buffer_offset)
         end
     end
-    ev = CUDA.CuEvent()
-    CUDA.record(ev, s)
-    return ev
+    
+    return nothing
 end
 
-function unpack_peer!(info::PeerCommInfo{T}, cache::Dict{Int,Any}) where T
+function gpu_unpack_peer!(info::GPUPeerCommInfo{T}, cache::Dict{Int,Any}) where T
     s = info.recv_stream
+    
     for pat in info.patterns
         dst_key = pat.dst_idx + 1000
         if haskey(cache, dst_key)
             dst = cache[dst_key]::CuArray{T,3}
             nx, ny, nz = length.(pat.dst_indices)
             xs, ys, zs = first.(pat.dst_indices)
+            
             launch_1d!(unpack_kernel!, pat.buffer_size, s, 256,
                       dst, info.recv_buffer, xs, ys, zs, nx, ny, nz, pat.buffer_offset)
         end
     end
-    ev = CUDA.CuEvent()
-    CUDA.record(ev, s)
-    return ev
+    
+    return nothing
 end
-
-<<<<<<< HEAD
-function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
-=======
 
 function pack_kernel!(send_buffer, src, xs, ys, zs, nx, ny, nz, offset)
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -753,7 +464,6 @@ function pack_kernel!(send_buffer, src, xs, ys, zs, nx, ny, nz, offset)
     return nothing
 end
 
-
 function unpack_kernel!(dst, recv_buffer, xs, ys, zs, nx, ny, nz, offset)
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     
@@ -768,7 +478,6 @@ function unpack_kernel!(dst, recv_buffer, xs, ys, zs, nx, ny, nz, offset)
     
     return nothing
 end
-
 
 function local_copy_kernel!(dst, src, dst_xs, dst_ys, dst_zs, src_xs, src_ys, src_zs, nx, ny, nz)
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -785,36 +494,35 @@ function local_copy_kernel!(dst, src, dst_xs, dst_ys, dst_zs, src_xs, src_ys, sr
     return nothing
 end
 
-
-function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{FFT,RFFT,R2R}},
->>>>>>> aa2f60d (R2R)
+# Pencil decomposition GPU FFT
+function gpu_fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
               workspace_AB::CoalescedWorkspace{T}, workspace_BC::CoalescedWorkspace{T},
               scope, transforms, dims, ::Pencil) where T
     
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(A.chunks)
-                @spawn apply_gpu_fft!(A.chunks[idx], In(transforms[1]), In(dims[1]))
+                Dagger.@spawn apply_gpu_fft!(A.chunks[idx], In(transforms[1]), In(dims[1]))
             end
         end
     end
     
-    coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
+    gpu_coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
     
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(B.chunks)
-                @spawn apply_gpu_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
+                Dagger.@spawn apply_gpu_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
             end
         end
     end
     
-    coalesced_redistribute!(C, B, workspace_BC; phase_id=2)
+    gpu_coalesced_redistribute!(C, B, workspace_BC; phase_id=2)
     
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(C.chunks)
-                @spawn apply_gpu_fft!(C.chunks[idx], In(transforms[3]), In(dims[3]))
+                Dagger.@spawn apply_gpu_fft!(C.chunks[idx], In(transforms[3]), In(dims[3]))
             end
         end
     end
@@ -822,24 +530,25 @@ function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple
     return C
 end
 
-function fft!(B::DArray{T,3}, A::DArray{T,3}, transforms::NTuple{<:Any,Union{FFT,RFFT,R2R}},
+# Slab decomposition GPU FFT
+function gpu_fft!(B::DArray{T,3}, A::DArray{T,3},
               workspace_AB::CoalescedWorkspace{T},
               scope, transforms, dims, ::Slab) where T
     
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(A.chunks)
-                @spawn apply_gpu_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
+                Dagger.@spawn apply_gpu_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
             end
         end
     end
     
-    coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
+    gpu_coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
     
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(B.chunks)
-                @spawn apply_gpu_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
+                Dagger.@spawn apply_gpu_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
             end
         end
     end
@@ -847,118 +556,66 @@ function fft!(B::DArray{T,3}, A::DArray{T,3}, transforms::NTuple{<:Any,Union{FFT
     return B
 end
 
-function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{IFFT,IRFFT,R2R}},
+# Pencil decomposition GPU IFFT
+function gpu_ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
                workspace_AB::CoalescedWorkspace{T}, workspace_BC::CoalescedWorkspace{T},
                scope, transforms, dims, ::Pencil) where T
     
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(A.chunks)
-                @spawn apply_gpu_fft!(A.chunks[idx], In(transforms[3]), In(dims[3]))
+                Dagger.@spawn apply_gpu_fft!(A.chunks[idx], In(transforms[3]), In(dims[3]))
             end
-        end
-        if transforms[3] isa R2R
-            A ./= (2 * size(A, dims[3]))
         end
     end
     
-    coalesced_redistribute!(B, A, workspace_AB; phase_id=3)
+    gpu_coalesced_redistribute!(B, A, workspace_AB; phase_id=3)
     
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(B.chunks)
-                @spawn apply_gpu_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
+                Dagger.@spawn apply_gpu_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
             end
-        end
-        if transforms[2] isa R2R
-            B ./= (2 * size(B, dims[2]))
         end
     end
     
-    coalesced_redistribute!(C, B, workspace_BC; phase_id=4)
+    gpu_coalesced_redistribute!(C, B, workspace_BC; phase_id=4)
     
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(C.chunks)
-                @spawn apply_gpu_fft!(C.chunks[idx], In(transforms[1]), In(dims[1]))
+                Dagger.@spawn apply_gpu_fft!(C.chunks[idx], In(transforms[1]), In(dims[1]))
             end
-        end
-        if transforms[1] isa R2R
-            C ./= (2 * size(C, dims[1]))
         end
     end
     
     return C
 end
 
-function ifft!(A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{IFFT,IRFFT,R2R}},
+# Slab decomposition GPU IFFT
+function gpu_ifft!(A::DArray{T,3}, B::DArray{T,3},
                workspace_BA::CoalescedWorkspace{T},
                scope, transforms, dims, ::Slab) where T
     
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(B.chunks)
-                @spawn apply_gpu_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
+                Dagger.@spawn apply_gpu_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
             end
-        end
-        if transforms[3] isa R2R
-            B ./= (2 * size(B, dims[3]))
         end
     end
     
-    coalesced_redistribute!(A, B, workspace_BA; phase_id=3)
+    gpu_coalesced_redistribute!(A, B, workspace_BA; phase_id=3)
     
-    # Last two dimensions done locally (no communication)
     spawn_datadeps(scheduler=:locality_aware) do
         Dagger.with_options(;scope) do
             for idx in eachindex(A.chunks)
-                @spawn apply_gpu_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
+                Dagger.@spawn apply_gpu_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
             end
-        end
-        if transforms[1] isa R2R
-            A ./= (2 * size(A, dims[1]) * size(A, dims[2]))
         end
     end
     
     return A
-end
-
-# High-level interface for Pencil
-function fft(A::DArray{T,3}, B::DArray{T,3}, C::DArray{T,3}, scope, transforms, dims,
-             ::Pencil=Pencil()) where T
-    
-    workspace_AB = create_gpu_workspace(A, B)
-    workspace_BC = create_gpu_workspace(B, C)
-    
-    return fft!(C, A, B, workspace_AB, workspace_BC, scope, transforms, dims, Pencil())
-end
-
-function ifft(A::DArray{T,3}, B::DArray{T,3}, C::DArray{T,3}, scope, transforms, dims,
-              ::Pencil=Pencil()) where T
-    
-    workspace_AB = create_gpu_workspace(A, B)
-    workspace_BC = create_gpu_workspace(B, C)
-    
-    return ifft!(C, A, B, workspace_AB, workspace_BC, scope, transforms, dims, Pencil())
-end
-
-# High-level interface for Slab
-function fft(A::DArray{T,3}, B::DArray{T,3}, scope, transforms, dims, ::Slab) where T
-    workspace_AB = create_gpu_workspace(A, B)
-    return fft!(B, A, workspace_AB, scope, transforms, dims, Slab())
-end
-
-function ifft(A::DArray{T,3}, B::DArray{T,3}, scope, transforms, dims, ::Slab) where T
-    workspace_BA = create_gpu_workspace(B, A)
-    return ifft!(A, B, workspace_BA, scope, transforms, dims, Slab())
-end
-
-function compute_overlap(src_domain, dst_domain)
-    return ntuple(i -> intersect(src_domain.indexes[i], dst_domain.indexes[i]), 3)
-end
-
-function generate_tag(peer_rank::Int, phase_id::Int)
-    return 1000 + phase_id * 97 + (peer_rank & 0x3FFF)
 end
 
 function check_cuda_aware_mpi()
@@ -970,38 +627,8 @@ function check_cuda_aware_mpi()
     end
 end
 
-function AbstractCollect(d::DArray{T,N}, backend=KernelAbstractions.GPU()) where {T,N}
-    total_size = size(d)
-    result = KernelAbstractions.zeros(backend, T, total_size...)
-
-    for (idx, chunk) in enumerate(d.chunks)
-        chunk_domain = d.subdomains[idx]
-        fetched_chunk = fetch(chunk)
-
-        if fetched_chunk === nothing
-            @warn "Chunk $idx was not computed. Filling with zeros."
-            fetched_chunk = KernelAbstractions.zeros(backend, T, map(length, chunk_domain.indexes)...)
-        end
-
-        indices = map(r -> r.start:r.stop, chunk_domain.indexes)
-        result[indices...] .= fetched_chunk
-    end
-
-    return result
-end
-
-function Base.similar(x::DArray{T,N}) where {T,N}
-    alloc(idx, sz) = CUDA.zeros(T, sz)
-    thunks = [Dagger.@spawn alloc(i, size(x)) for (i, x) in enumerate(x.subdomains)]
-    return DArray(T, x.domain, x.subdomains, thunks, x.partitioning, x.concat)
-end
-
-function cleanup_workspace!(workspace::CoalescedWorkspace)
+function gpu_cleanup_workspace!(workspace::CoalescedWorkspace)
     empty!(workspace.chunk_cache)
+    empty!(GPU_PLAN_CACHE)
     CUDA.reclaim()
-    
-end
-
-const GPUFFTWorkspace = CoalescedWorkspace
-
 end

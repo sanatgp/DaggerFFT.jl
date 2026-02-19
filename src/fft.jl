@@ -1,15 +1,3 @@
-module DaggerFFTs
-
-using AbstractFFTs
-using LinearAlgebra
-using FFTW
-using Dagger: DArray, @spawn, InOut, In
-import Dagger: Chunk, DArray, @spawn, InOut, In
-using Dagger
-using MPI
-
-import MPI: Comm_rank, Comm_size
-
 const R2R_SUPPORTED_KINDS = (
     FFTW.DHT,
     FFTW.REDFT00,
@@ -21,23 +9,6 @@ const R2R_SUPPORTED_KINDS = (
     FFTW.RODFT10,
     FFTW.RODFT11,
 )
-
-"""
-DHT (Discrete Hartley Transform):
-The DHT is its own inverse, so forward and backward are the same.
-
-REDFT (Real Even Discrete Fourier Transform):
-REDFT00 (Type I DCT): Its own inverse (symmetric)
-REDFT10 (Type II DCT): Forward transform
-REDFT01 (Type III DCT): Backward transform (inverse of REDFT10)
-REDFT11 (Type IV DCT): Its own inverse (symmetric)
-
-RODFT (Real Odd Discrete Fourier Transform):
-RODFT00 (Type I DST): Its own inverse (symmetric)
-RODFT10 (Type II DST): Forward transform
-RODFT01 (Type III DST): Backward transform (inverse of RODFT10)
-RODFT11 (Type IV DST): Its own inverse (symmetric)
-"""
 
 abstract type Decomposition end
 struct Pencil <: Decomposition end
@@ -51,10 +22,6 @@ struct FFT! end
 struct RFFT! end
 struct IRFFT! end
 struct IFFT! end
-
-export FFT, RFFT, IRFFT, IFFT, FFT!, RFFT!, IRFFT!, IFFT!, fft, ifft, fft!, ifft!
-export FFTWorkspace, create_workspace
-export Pencil, Slab
 
 struct HierarchicalInfo
     node_rank::Int
@@ -120,7 +87,6 @@ mutable struct FFTWorkspace{T}
     recv_peers::Dict{Int, PeerCommInfo{T}}
     local_patterns::Vector{CoalescedPattern}
     
-    # Hierarchical support
     hierarchical::Union{HierarchicalInfo, Nothing}
     node_send_buffers::Dict{Int, Vector{T}}
     node_recv_buffers::Dict{Int, Vector{T}}
@@ -215,7 +181,7 @@ function pack_data!(buffer::Vector{T}, src::Array{T,3}, indices::NTuple{3, UnitR
     nx, ny, nz = length.(indices)
     xs, ys, zs = first.(indices)
     
-    Threads.@threads for k in 1:nz
+    @inbounds for k in 1:nz
         kk = zs + k - 1
         for j in 1:ny
             jj = ys + j - 1
@@ -233,7 +199,7 @@ function unpack_data!(dst::Array{T,3}, buffer::Vector{T}, indices::NTuple{3, Uni
     nx, ny, nz = length.(indices)
     xs, ys, zs = first.(indices)
     
-    Threads.@threads for k in 1:nz
+    @inbounds for k in 1:nz
         kk = zs + k - 1
         for j in 1:ny
             jj = ys + j - 1
@@ -254,7 +220,7 @@ function local_copy!(dst::Array{T,3}, src::Array{T,3},
     dst_xs, dst_ys, dst_zs = first.(dst_indices)
     src_xs, src_ys, src_zs = first.(src_indices)
     
-    Threads.@threads for k in 1:nz
+    @inbounds for k in 1:nz
         for j in 1:ny
             for i in 1:nx
                 dst[dst_xs+i-1, dst_ys+j-1, dst_zs+k-1] = src[src_xs+i-1, src_ys+j-1, src_zs+k-1]
@@ -441,18 +407,13 @@ function create_workspace(src::DArray{T,3}, dst::DArray{T,3};
 end
 
 function coalesced_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::FFTWorkspace{T}; phase_id::Int=1) where T
-    if workspace.use_hierarchical && workspace.hierarchical !== nothing
-        hierarchical_redistribute!(dst, src, workspace, phase_id)
-    else
-        flat_redistribute!(dst, src, workspace, phase_id)
-    end
+    flat_redistribute!(dst, src, workspace, phase_id)
 end
 
 function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::FFTWorkspace{T}, phase_id::Int) where T
     comm = MPI.COMM_WORLD
     rank = Comm_rank(comm)
     
-    # Cache chunks
     workspace.chunk_cache = Dict{Int, Any}()
     
     for (idx, chunk) in enumerate(src.chunks)
@@ -467,14 +428,12 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::FFTWo
         end
     end
     
-    # Post all receives early
     for (i, src_rank) in enumerate(workspace.recv_ranks)
         peer_info = workspace.recv_peers[src_rank]
         tag = generate_tag(src_rank, phase_id)
         workspace.recv_reqs[i] = MPI.Irecv!(peer_info.recv_buffer, src_rank, tag, comm)
     end
     
-    # Pack all send buffers
     for dst_rank in workspace.send_ranks
         peer_info = workspace.send_peers[dst_rank]
         for pattern in peer_info.patterns
@@ -485,7 +444,6 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::FFTWo
         end
     end
     
-    # Post all sends
     for (i, dst_rank) in enumerate(workspace.send_ranks)
         tag = generate_tag(rank, phase_id)
         peer_info = workspace.send_peers[dst_rank]
@@ -514,7 +472,6 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::FFTWo
                     src_rank = workspace.recv_ranks[i]
                     peer_info = workspace.recv_peers[src_rank]
                     
-                    # Unpack immediately
                     for pattern in peer_info.patterns
                         dst_key = pattern.dst_idx + 1000
                         if haskey(workspace.chunk_cache, dst_key)
@@ -535,10 +492,6 @@ function flat_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::FFTWo
             yield()
         end
     end
-    
-    for i in 1:length(workspace.send_reqs)
-        MPI.Wait!(workspace.send_reqs[i])
-    end
 end
 
 function hierarchical_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspace::FFTWorkspace{T}, phase_id::Int) where T
@@ -546,7 +499,6 @@ function hierarchical_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspac
     comm = MPI.COMM_WORLD
     rank = Comm_rank(comm)
     
-    # Cache chunks
     workspace.chunk_cache = Dict{Int, Any}()
     
     for (idx, chunk) in enumerate(src.chunks)
@@ -567,8 +519,8 @@ function hierarchical_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspac
             
             for pattern in patterns
                 if haskey(workspace.chunk_cache, pattern.src_idx)
-                    src = workspace.chunk_cache[pattern.src_idx]
-                    pack_data!(node_buffer, src, pattern.src_indices, pattern.buffer_offset)
+                    src_data = workspace.chunk_cache[pattern.src_idx]
+                    pack_data!(node_buffer, src_data, pattern.src_indices, pattern.buffer_offset)
                 end
             end
         end
@@ -577,7 +529,6 @@ function hierarchical_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspac
     MPI.Barrier(hierarchical.node_comm)
     
     if hierarchical.is_aggregator
-        # Post receives from other node aggregators
         for (i, source_node) in enumerate(workspace.source_nodes)
             if haskey(workspace.node_recv_buffers, source_node)
                 node_buffer = workspace.node_recv_buffers[source_node]
@@ -609,8 +560,8 @@ function hierarchical_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspac
                         for pattern in workspace.intra_recv_patterns[source_node]
                             dst_key = pattern.dst_idx + 1000
                             if haskey(workspace.chunk_cache, dst_key)
-                                dst = workspace.chunk_cache[dst_key]
-                                unpack_data!(dst, node_buffer, pattern.dst_indices, pattern.buffer_offset)
+                                dst_data = workspace.chunk_cache[dst_key]
+                                unpack_data!(dst_data, node_buffer, pattern.dst_indices, pattern.buffer_offset)
                             end
                         end
                     end
@@ -651,7 +602,6 @@ function hierarchical_redistribute!(dst::DArray{T,3}, src::DArray{T,3}, workspac
         workspace.send_reqs[i] = MPI.Isend(peer_info.send_buffer, dst_rank, tag, comm)
     end
     
-    # Progressive unpacking
     remaining = Set(1:length(workspace.recv_ranks))
     while !isempty(remaining)
         for i in copy(remaining)
@@ -697,168 +647,128 @@ function generate_tag(peer_rank::Int, phase_id::Int)
     return 1000 + phase_id * 97 + (peer_rank & 0x3FFF)
 end
 
-<<<<<<< HEAD
-
+# Pencil decomposition FFT (3 stages, 2 redistributions)
 function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
-=======
-function fft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{FFT,RFFT,R2R}},
->>>>>>> aa2f60d (R2R)
               workspace_AB::FFTWorkspace{T}, workspace_BC::FFTWorkspace{T},
               transforms, dims) where T
-    
-    Dagger.spawn_datadeps(scheduler=:dynamic,
-              enable_continuous_stealing=true,
-              steal_threshold_ms=3.0) do
-        for idx in eachindex(A.chunks)
-            @spawn apply_fft!(A.chunks[idx], In(transforms[1]), In(dims[1]))
+    NVTX.@range "DIM 1" begin
+        spawn_datadeps(scheduler=:dynamic,
+                      enable_continuous_stealing=true,
+                      steal_threshold_ms=3.0) do
+            for idx in eachindex(A.chunks)
+                Dagger.@spawn apply_fft!(A.chunks[idx], In(transforms[1]), In(dims[1]))
+            end
         end
     end
-<<<<<<< HEAD
-    
-    coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
-    
-=======
-    end
-        NVTX.@range "Redistribute 1" begin
+    NVTX.@range "Redistribute 1" begin
         coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
     end
     NVTX.@range "DIM 2" begin
->>>>>>> aa2f60d (R2R)
-    Dagger.spawn_datadeps(scheduler=:dynamic,
-              enable_continuous_stealing=true,
-              steal_threshold_ms=3.0) do
-        for idx in eachindex(B.chunks)
-            @spawn apply_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
+        spawn_datadeps(scheduler=:dynamic,
+                      enable_continuous_stealing=true,
+                      steal_threshold_ms=3.0) do
+            for idx in eachindex(B.chunks)
+                Dagger.@spawn apply_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
+            end
         end
     end
-<<<<<<< HEAD
-    
-    coalesced_redistribute!(C, B, workspace_BC; phase_id=2)
-    
-=======
-    end
-        NVTX.@range "Redistribute 2" begin
+    NVTX.@range "Redistribute 2" begin
         coalesced_redistribute!(C, B, workspace_BC; phase_id=2)
     end
     NVTX.@range "DIM 3" begin
->>>>>>> aa2f60d (R2R)
-    Dagger.spawn_datadeps(scheduler=:dynamic,
-              enable_continuous_stealing=true,
-              steal_threshold_ms=3.0) do
-        for idx in eachindex(C.chunks)
-            @spawn apply_fft!(C.chunks[idx], In(transforms[3]), In(dims[3]))
+        spawn_datadeps(scheduler=:dynamic,
+                      enable_continuous_stealing=true,
+                      steal_threshold_ms=3.0) do
+            for idx in eachindex(C.chunks)
+                Dagger.@spawn apply_fft!(C.chunks[idx], In(transforms[3]), In(dims[3]))
+            end
         end
     end
-    
     return C
 end
 
-function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3}, transforms::NTuple{<:Any,Union{IFFT,IRFFT,R2R}},
+# Pencil decomposition IFFT
+function ifft!(C::DArray{T,3}, A::DArray{T,3}, B::DArray{T,3},
                workspace_AB::FFTWorkspace{T}, workspace_BC::FFTWorkspace{T},
                transforms, dims) where T
     
-     Dagger.spawn_datadeps(scheduler=:dynamic,
-               enable_continuous_stealing=true,
-               steal_threshold_ms=3.0) do
+    spawn_datadeps(scheduler=:dynamic,
+                  enable_continuous_stealing=true,
+                  steal_threshold_ms=3.0) do
         for idx in eachindex(A.chunks)
-            @spawn apply_fft!(A.chunks[idx], In(transforms[3]), In(dims[3]))
-        end
-        if transforms[3] isa R2R
-            A ./= (2 * size(A, dims[3]))
+            Dagger.@spawn apply_fft!(A.chunks[idx], In(transforms[3]), In(dims[3]))
         end
     end
     
     coalesced_redistribute!(B, A, workspace_AB; phase_id=3)
     
-    Dagger.spawn_datadeps(scheduler=:dynamic,
-<<<<<<< HEAD
-                enable_continuous_stealing=true,
-                steal_threshold_ms=3.0) do
-=======
-                         enable_continuous_stealing=true,
-                         steal_threshold_ms=3.0) do
->>>>>>> aa2f60d (R2R)
+    spawn_datadeps(scheduler=:dynamic,
+                  enable_continuous_stealing=true,
+                  steal_threshold_ms=3.0) do
         for idx in eachindex(B.chunks)
-            @spawn apply_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
-        end
-        if transforms[2] isa R2R
-            B ./= (2 * size(B, dims[3]))
+            Dagger.@spawn apply_fft!(B.chunks[idx], In(transforms[2]), In(dims[2]))
         end
     end
     
     coalesced_redistribute!(C, B, workspace_BC; phase_id=4)
     
-    Dagger.spawn_datadeps(scheduler=:dynamic,
-               enable_continuous_stealing=true,
-               steal_threshold_ms=3.0) do
+    spawn_datadeps(scheduler=:dynamic,
+                  enable_continuous_stealing=true,
+                  steal_threshold_ms=3.0) do
         for idx in eachindex(C.chunks)
-            @spawn apply_fft!(C.chunks[idx], In(transforms[1]), In(dims[1]))
-        end
-        if transforms[1] isa R2R
-            C ./= (2 * size(C, dims[1]))
+            Dagger.@spawn apply_fft!(C.chunks[idx], In(transforms[1]), In(dims[1]))
         end
     end
     
     return C
 end
 
+# Slab decomposition FFT (2 stages, 1 redistribution)
 function fft!(B::DArray{T,3}, A::DArray{T,3},
               workspace_AB::FFTWorkspace{T},
               transforms, dims, ::Slab) where T
-    
-    Dagger.spawn_datadeps(scheduler=:dynamic,
-              enable_continuous_stealing=true,
-              steal_threshold_ms=3.0) do
-        for idx in eachindex(A.chunks)
-            @spawn apply_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
+    NVTX.@range "DIM 1" begin
+        spawn_datadeps(scheduler=:dynamic,
+                      enable_continuous_stealing=true,
+                      steal_threshold_ms=3.0) do
+            for idx in eachindex(A.chunks)
+                Dagger.@spawn apply_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
+            end
         end
-    end
-<<<<<<< HEAD
-    
-    coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
-    
-=======
     end
     NVTX.@range "Redistribute 1" begin
         coalesced_redistribute!(B, A, workspace_AB; phase_id=1)
     end
->>>>>>> aa2f60d (R2R)
-    Dagger.spawn_datadeps(scheduler=:dynamic,
-                enable_continuous_stealing=true,
-                steal_threshold_ms=3.0) do
+    spawn_datadeps(scheduler=:dynamic,
+                  enable_continuous_stealing=true,
+                  steal_threshold_ms=3.0) do
         for idx in eachindex(B.chunks)
-            @spawn apply_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
+            Dagger.@spawn apply_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
         end
     end
-    
     return B
 end
 
+# Slab decomposition IFFT
 function ifft!(A::DArray{T,3}, B::DArray{T,3},
                workspace_BA::FFTWorkspace{T},
                transforms, dims, ::Slab) where T
     
-    Dagger.spawn_datadeps(scheduler=:dynamic,
-               enable_continuous_stealing=true,
-               steal_threshold_ms=3.0) do
+    spawn_datadeps(scheduler=:dynamic,
+                  enable_continuous_stealing=true,
+                  steal_threshold_ms=3.0) do
         for idx in eachindex(B.chunks)
-            @spawn apply_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
-        end
-        if transforms[3] isa R2R
-            B ./= (2 * size(B, dims[3]))
+            Dagger.@spawn apply_fft!(B.chunks[idx], In(transforms[3]), In(dims[3]))
         end
     end
     
     coalesced_redistribute!(A, B, workspace_BA; phase_id=3)
     
-    Dagger.spawn_datadeps(scheduler=:dynamic,
-                enable_continuous_stealing=true,
-                steal_threshold_ms=3.0) do        
+    spawn_datadeps(scheduler=:dynamic,
+                  enable_continuous_stealing=true,
+                  steal_threshold_ms=3.0) do
         for idx in eachindex(A.chunks)
-            @spawn apply_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
-        end
-        if transforms[1] isa R2R
-            A ./= (2 * size(A, dims[1]) * size(A, dims[2]))
+            Dagger.@spawn apply_fft!(A.chunks[idx], In(transforms[1]), In((dims[1], dims[2])))
         end
     end
     
@@ -869,5 +779,3 @@ function cleanup_workspace!(workspace::FFTWorkspace)
     empty!(workspace.chunk_cache)
     empty!(PLAN_CACHE)
 end
-
-end 
