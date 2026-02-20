@@ -24,3 +24,6 @@ Graphs = "1.13.1"
 LinearAlgebra = "1.11.0"
 LoopVectorization = "0.12.173"
 Statistics = "1.11.1"
+
+[sources]
+Dagger = {url = "https://github.com/sanatgp/Dagger.jl", rev = "DaggerFFT"}
