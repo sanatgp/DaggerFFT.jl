@@ -48,7 +48,6 @@ function solve!(x, solver::DistributedFFTBasedPoissonSolver)
         @allowscalar x̂[1, 1, 1] = 0
     end
 
-    # TIME ONLY INVERSE FFT
     MPI.Barrier(comm)
     ifft_start = MPI.Wtime()
 
