@@ -10,8 +10,10 @@
 # Examples:
 #   mpiexec -np 4  julia --project=oceananigans/ oceananigans/oceananigans_benchmark.jl baseline 896 448 224 2 2 PPP
 #   mpiexec -np 28 julia --project=oceananigans/ oceananigans/oceananigans_benchmark.jl dagger  896 448 224 7 4 PPP
+using MPI: MPI, mpiexec
+using InteractiveUtils: versioninfo
 
-using MPI
+#using MPI
 MPI.Init()
 
 using Random
