@@ -1,7 +1,4 @@
 #!/usr/bin/env julia
-# Oceananigans Poisson Solver Benchmark
-# Place this file in: DaggerFFT.jl/oceananigans/oceananigans_benchmark.jl
-#
 # Usage: mpiexec -np <N> julia --project=oceananigans/ oceananigans/oceananigans_benchmark.jl <mode> <Nx> <Ny> <Nz> <Rx> <Ry> <topo>
 #
 # Arguments:
@@ -36,12 +33,10 @@ include("dependencies_for_poisson_solvers.jl")
 using Oceananigans.DistributedComputations: reconstruct_global_grid, DistributedGrid, Partition
 using Oceananigans.Models.NonhydrostaticModels: solve_for_pressure!
 
-# Timing arrays for baseline (referenced by Main.global_baseline_fft_times in solve! override)
 const global_baseline_fft_times = Float64[]
 const global_baseline_ifft_times = Float64[]
 
 if mode == "baseline"
-    # Override solve! with timing instrumentation
     include(joinpath(@__DIR__, "distributed_fft_based_poisson_solver.jl"))
 else
     using Dagger
@@ -50,7 +45,6 @@ else
     include(joinpath(@__DIR__, "dagger_oceananigans_integration.jl"))
 end
 
-# Map topology string
 topo_map = Dict(
     "PPP" => (Periodic, Periodic, Periodic),
     "PPB" => (Periodic, Periodic, Bounded),
@@ -96,7 +90,6 @@ function random_divergent_source_term(grid::DistributedGrid)
     return R, U
 end
 
-# Setup
 arch = Distributed(child_arch, partition=Partition(Rx, Ry, 1))
 local_grid = RectilinearGrid(arch, topology=grid_topo, size=(Nx, Ny, Nz), extent=(2π, 2π, 2π))
 global_grid = reconstruct_global_grid(local_grid)
@@ -113,7 +106,6 @@ end
 # Warmup
 solve_for_pressure!(ϕ, solver, 1, U)
 
-# Clear timing arrays
 if mode == "dagger"
     empty!(global_dagger_fft_times)
     empty!(global_dagger_ifft_times)
@@ -122,7 +114,6 @@ else
     empty!(global_baseline_ifft_times)
 end
 
-# Timed runs — solve! internally records FFT/IFFT times
 num_runs = 5
 for i in 1:num_runs
     solve_for_pressure!(ϕ, solver, 1, U)
@@ -130,7 +121,6 @@ end
 
 MPI.Barrier(comm)
 
-# Report
 if rank == 0
     if mode == "dagger"
         fft_times  = global_dagger_fft_times
@@ -155,13 +145,11 @@ if rank == 0
         fftsize = Float64(Nx * Ny * Nz)
         floprate = 2.0 * 5.0 * fftsize * log2(fftsize) * 1e-9 / avg_total
 
-        println("=============================================================================")
         println("$(label): Grid ($(Nx), $(Ny), $(Nz)), Ranks ($(Rx), $(Ry), 1), Topology $(topo_s)")
         println("Forward FFT  - Avg: $(round(avg_fft, digits=6)) s, Min: $(round(min_fft, digits=6)) s, Max: $(round(max_fft, digits=6)) s")
         println("Inverse FFT  - Avg: $(round(avg_ifft, digits=6)) s, Min: $(round(min_ifft, digits=6)) s, Max: $(round(max_ifft, digits=6)) s")
         println("Total FFT Time: $(round(avg_total, digits=6)) seconds")
         println("FFT Performance: $(round(floprate, digits=2)) GFlops/s")
-        println("=============================================================================")
         flush(stdout)
     end
 end
