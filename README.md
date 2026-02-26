@@ -1,4 +1,8 @@
 # DaggerFFT.jl
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18707128.svg)](https://doi.org/10.5281/zenodo.18707128)
+![GitHub release](https://img.shields.io/github/v/release/sanatgp/DaggerFFT.jl)
+
 Scalable distributed FFT implementation for heterogeneous CPU/GPU systems, built on Dagger.jl
 
 ![Task-scheduled 3D FFT pipeline](docs/assets/pencil.png)
