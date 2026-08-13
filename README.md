@@ -67,11 +67,12 @@ A_recon = ifft(F; decomp=Slab(), transforms=(R2R((FFTW.REDFT01, FFTW.REDFT01)),)
 ```
 
 ```julia
-@article{anvari2026daggerfft,
-  title   = {DaggerFFT: A Distributed FFT Framework Using Task Scheduling in Julia},
-  author  = {Anvari, Sana Taghipour and Samaroo, Julian and Raayai Ardakani, Matin and Kaeli, David},
-  journal = {arXiv preprint arXiv:2601.12209},
-  year    = {2026},
-  doi     = {10.48550/arXiv.2601.12209}
+@inproceedings{anvari2026daggerfft,
+  title     = {DaggerFFT: A Distributed FFT Framework Using Task Scheduling in Julia},
+  author    = {Anvari, Sana Taghipour and Samaroo, Julian and Raayai Ardakani, Matin and Kaeli, David},
+  booktitle = {2026 IEEE International Parallel and Distributed Processing Symposium (IPDPS)},
+  pages     = {1120--1133},
+  year      = {2026},
+  doi       = {10.48550/arXiv.2601.12209}
 }
 ```
